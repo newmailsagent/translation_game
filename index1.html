@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Screen Link</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --line: #21262d;
+    --text: #e6edf3;
+    --dim: #8b949e;
+    --accent: #3fb0ff;
+    --danger: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 ui-monospace, "SF Mono", Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  #status { color: var(--dim); font-size: 13px; }
+  #status.on { color: var(--accent); }
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    gap: 16px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 24px;
+    width: 100%;
+    max-width: 440px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  button {
+    font: inherit;
+    padding: 10px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: #1f6feb;
+    color: #fff;
+    cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--text); }
+  button.muted { background: var(--danger); }
+  button:hover { filter: brightness(1.15); }
+  input {
+    font: inherit;
+    padding: 10px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--text);
+  }
+  label.check {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    color: var(--dim);
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .hint { color: var(--dim); font-size: 13px; }
+  video {
+    max-width: 100%;
+    max-height: calc(100vh - 130px);
+    background: #000;
+    border-radius: 8px;
+    display: none;
+  }
+  #hostBar { display: none; gap: 10px; }
+  #stats {
+    position: fixed;
+    bottom: 10px;
+    right: 12px;
+    color: var(--dim);
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Screen&nbsp;Link</h1>
+  <span id="status">не подключено</span>
+</header>
+
+<main>
+  <div class="panel" id="setup">
+    <input id="tokenInput" type="password" placeholder="секретный токен" autocomplete="off">
+    <label class="check">
+      <input type="checkbox" id="micCheck" checked>
+      транслировать микрофон (комментарии)
+    </label>
+    <button id="btnHost">Транслировать мой экран</button>
+    <button id="btnView" class="secondary">Смотреть трансляцию</button>
+    <div class="hint">
+      Токен удобно передавать прямо в ссылке после «#».
+      Хост при выборе экрана обязательно включает
+      «Поделиться звуком», иначе звука игры не будет.
+    </div>
+  </div>
+
+  <div id="hostBar" class="panel" style="max-width:300px">
+    <button id="btnMic">🎙 Микрофон: вкл</button>
+    <button id="btnStop" class="secondary">Завершить трансляцию</button>
+  </div>
+
+  <video id="video" autoplay playsinline></video>
+</main>
+
+<div id="stats"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+
+if (location.hash.length > 1) {
+  $("tokenInput").value = decodeURIComponent(location.hash.slice(1));
+}
+
+function setStatus(text, on) {
+  $("status").textContent = text;
+  $("status").className = on ? "on" : "";
+}
+
+// ─── Комната = SHA-256(токен) ────────────────────────────────────────────
+// Сам токен в облако PeerJS не попадает: там виден только хэш.
+// Зритель дополнительно предъявляет токен целиком, хост его сверяет.
+async function roomId(token) {
+  const data = new TextEncoder().encode("screen-link:" + token);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return "sl" + [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 40);
+}
+
+// Максимальное качество Opus: стерео, 510 кбит/с
+function boostOpus(sdp) {
+  return sdp.replace(
+    /a=fmtp:(\d+) (.*useinbandfec=1.*)/g,
+    "a=fmtp:$1 $2;stereo=1;sprop-stereo=1;maxaveragebitrate=510000;maxplaybackrate=48000"
+  );
+}
+
+// ─── ХОСТ ────────────────────────────────────────────────────────────────
+let peer, currentCall, micGain, screenStream, micStream, audioCtx;
+
+$("btnHost").onclick = async () => {
+  const token = $("tokenInput").value.trim();
+  if (token.length < 16) return setStatus("токен слишком короткий (мин. 16)");
+
+  // 1. Экран + звук системы
+  try {
+    screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        frameRate: { ideal: 60, max: 60 },
+        width: { ideal: 3840 },
+        height: { ideal: 2160 },
+      },
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 2,
+        sampleRate: 48000,
+      },
+      systemAudio: "include",
+    });
+  } catch {
+    return setStatus("захват экрана отменён");
+  }
+
+  // 2. Микрофон (по желанию)
+  if ($("micCheck").checked) {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,   // чтобы звук игры из колонок не летел обратно
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+      });
+    } catch {
+      setStatus("микрофон недоступен, трансляция без него");
+    }
+  }
+
+  // 3. Смешиваем звук игры и микрофон в одну дорожку
+  const videoTrack = screenStream.getVideoTracks()[0];
+  videoTrack.contentHint = "motion"; // приоритет плавности — это игры
+  const outTracks = [videoTrack];
+
+  const hasSysAudio = screenStream.getAudioTracks().length > 0;
+  if (hasSysAudio || micStream) {
+    audioCtx = new AudioContext({ sampleRate: 48000 });
+    const dest = audioCtx.createMediaStreamDestination();
+    if (hasSysAudio) {
+      audioCtx
+        .createMediaStreamSource(new MediaStream(screenStream.getAudioTracks()))
+        .connect(dest);
+    }
+    if (micStream) {
+      micGain = audioCtx.createGain();
+      audioCtx.createMediaStreamSource(micStream).connect(micGain);
+      micGain.connect(dest);
+    }
+    outTracks.push(dest.stream.getAudioTracks()[0]);
+  }
+  if (!hasSysAudio)
+    setStatus("внимание: звук системы не захвачен (нет галочки «поделиться звуком»)");
+
+  const outStream = new MediaStream(outTracks);
+
+  $("setup").style.display = "none";
+  $("hostBar").style.display = "flex";
+  if (!micStream) $("btnMic").style.display = "none";
+
+  // 4. Регистрируемся в комнате и ждём зрителя
+  peer = new Peer(await roomId(token), { debug: 0 });
+  peer.on("open", () => setStatus("ожидание зрителя…"));
+  peer.on("error", (e) => {
+    if (e.type === "unavailable-id")
+      setStatus("эта комната уже занята (трансляция уже идёт?)");
+    else setStatus("ошибка связи: " + e.type);
+  });
+
+  // Клиентский rate-limit: не больше 5 попыток подключения в минуту
+  const attempts = [];
+  peer.on("connection", (conn) => {
+    const now = Date.now();
+    while (attempts.length && now - attempts[0] > 60_000) attempts.shift();
+    if (attempts.length >= 5) { conn.close(); return; }
+    attempts.push(now);
+
+    conn.on("data", (msg) => {
+      if (msg?.token !== token) {          // сверяем токен целиком
+        conn.close();
+        return;
+      }
+      setStatus("зритель подключается…");
+      if (currentCall) currentCall.close(); // новый зритель вытесняет старого
+
+      currentCall = peer.call(conn.peer, outStream, {
+        sdpTransform: boostOpus,
+      });
+
+      // Максимальный битрейт видео
+      currentCall.on("stream", () => {});
+      setTimeout(async () => {
+        const pc = currentCall.peerConnection;
+        for (const sender of pc.getSenders()) {
+          if (sender.track?.kind !== "video") continue;
+          const p = sender.getParameters();
+          p.encodings = [{ maxBitrate: 50_000_000, maxFramerate: 60 }];
+          p.degradationPreference = "maintain-framerate";
+          await sender.setParameters(p).catch(() => {});
+        }
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === "connected")
+            setStatus("идёт трансляция", true);
+          if (["failed", "disconnected"].includes(pc.connectionState))
+            setStatus("зритель отвалился, жду переподключения…");
+        };
+      }, 500);
+    });
+  });
+
+  // Если хост закрыл захват крестиком браузера — завершаем
+  videoTrack.onended = stopHosting;
+  $("btnStop").onclick = stopHosting;
+
+  // Кнопка mute микрофона
+  let micOn = true;
+  $("btnMic").onclick = () => {
+    micOn = !micOn;
+    micGain.gain.value = micOn ? 1 : 0;
+    $("btnMic").textContent = micOn ? "🎙 Микрофон: вкл" : "🎙 Микрофон: выкл";
+    $("btnMic").className = micOn ? "" : "muted";
+  };
+};
+
+function stopHosting() {
+  currentCall?.close();
+  peer?.destroy();
+  screenStream?.getTracks().forEach((t) => t.stop());
+  micStream?.getTracks().forEach((t) => t.stop());
+  audioCtx?.close();
+  $("hostBar").style.display = "none";
+  $("setup").style.display = "flex";
+  setStatus("трансляция завершена");
+}
+
+// ─── ЗРИТЕЛЬ ─────────────────────────────────────────────────────────────
+$("btnView").onclick = async () => {
+  const token = $("tokenInput").value.trim();
+  if (!token) return setStatus("введите токен");
+
+  $("setup").style.display = "none";
+  video.style.display = "block";
+  video.controls = true;
+
+  const hostId = await roomId(token);
+  peer = new Peer({ debug: 0 }); // случайный собственный id
+  peer.on("error", (e) => {
+    if (e.type === "peer-unavailable")
+      setStatus("хост не найден: трансляция ещё не запущена?");
+    else setStatus("ошибка связи: " + e.type);
+  });
+
+  peer.on("open", () => {
+    setStatus("подключение к хосту…");
+    const conn = peer.connect(hostId, { reliable: true });
+    conn.on("open", () => conn.send({ token })); // предъявляем токен
+  });
+
+  peer.on("call", (call) => {
+    call.answer(); // зритель ничего не отправляет
+    call.on("stream", (stream) => {
+      video.srcObject = stream;
+      video.play().catch(() => setStatus("нажмите на видео для запуска"));
+      setStatus("смотрим", true);
+      startStats(call.peerConnection);
+    });
+    call.on("close", () => {
+      setStatus("хост завершил трансляцию");
+      video.srcObject = null;
+    });
+  });
+};
+
+// Статистика в углу: разрешение, fps, битрейт
+function startStats(pc) {
+  let lastBytes = 0, lastTime = 0;
+  setInterval(async () => {
+    const stats = await pc.getStats();
+    stats.forEach((r) => {
+      if (r.type === "inbound-rtp" && r.kind === "video") {
+        const mbps = lastTime
+          ? (((r.bytesReceived - lastBytes) * 8) /
+             ((r.timestamp - lastTime) / 1000) / 1e6).toFixed(1)
+          : "…";
+        lastBytes = r.bytesReceived;
+        lastTime = r.timestamp;
+        $("stats").textContent =
+          `${r.frameWidth || "?"}×${r.frameHeight || "?"} @ ${r.framesPerSecond || "?"} fps · ${mbps} Мбит/с`;
+      }
+    });
+  }, 2000);
+}
+</script>
+</body>
+</html>
