@@ -67,7 +67,7 @@
   button.secondary { background: transparent; color: var(--text); }
   button.muted { background: var(--danger); }
   button:hover { filter: brightness(1.15); }
-  input {
+  input, select {
     font: inherit;
     padding: 10px 12px;
     border-radius: 6px;
@@ -110,6 +110,12 @@
 <main>
   <div class="panel" id="setup">
     <input id="tokenInput" type="password" placeholder="секретный токен" autocomplete="off">
+    <select id="preset">
+      <option value="1080p60">1080p 60fps · ~12 Мбит/с (рекомендуется)</option>
+      <option value="1440p60">1440p 60fps · ~24 Мбит/с</option>
+      <option value="4k60">4K 60fps · ~45 Мбит/с (нужен мощный аплоад)</option>
+      <option value="1080p30">1080p 30fps · ~7 Мбит/с (слабый канал)</option>
+    </select>
     <label class="check">
       <input type="checkbox" id="micCheck" checked>
       транслировать микрофон (комментарии)
@@ -117,8 +123,8 @@
     <button id="btnHost">Транслировать мой экран</button>
     <button id="btnView" class="secondary">Смотреть трансляцию</button>
     <div class="hint">
-      Токен удобно передавать прямо в ссылке после «#».
-      Хост при выборе экрана обязательно включает
+      Битрейт пресета должен быть ниже вашей скорости отдачи (upload)
+      примерно на четверть. Хост при выборе экрана включает
       «Поделиться звуком», иначе звука игры не будет.
     </div>
   </div>
@@ -138,6 +144,13 @@
 
 const $ = (id) => document.getElementById(id);
 const video = $("video");
+
+const PRESETS = {
+  "1080p60": { w: 1920, h: 1080, fps: 60, bitrate: 12_000_000 },
+  "1440p60": { w: 2560, h: 1440, fps: 60, bitrate: 24_000_000 },
+  "4k60":    { w: 3840, h: 2160, fps: 60, bitrate: 45_000_000 },
+  "1080p30": { w: 1920, h: 1080, fps: 30, bitrate: 7_000_000 },
+};
 
 if (location.hash.length > 1) {
   $("tokenInput").value = decodeURIComponent(location.hash.slice(1));
@@ -160,7 +173,26 @@ async function roomId(token) {
     .slice(0, 40);
 }
 
-// Максимальное качество Opus: стерео, 510 кбит/с
+// ─── SDP: аппаратный H.264 + максимальный Opus ──────────────────────────
+// H.264 кодируется видеокартой (NVENC/AMF/QuickSync) и почти не грузит
+// CPU — это лечит фризы в игре. VP8 по умолчанию кодируется процессором.
+function preferCodec(sdp, codec) {
+  const lines = sdp.split("\r\n");
+  const mIdx = lines.findIndex((l) => l.startsWith("m=video"));
+  if (mIdx === -1) return sdp;
+  const pts = [];
+  for (const l of lines) {
+    const m = l.match(new RegExp("^a=rtpmap:(\\d+) " + codec + "/", "i"));
+    if (m) pts.push(m[1]);
+  }
+  if (!pts.length) return sdp;
+  const parts = lines[mIdx].split(" ");
+  const head = parts.slice(0, 3);
+  const rest = parts.slice(3).filter((pt) => !pts.includes(pt));
+  lines[mIdx] = [...head, ...pts, ...rest].join(" ");
+  return lines.join("\r\n");
+}
+
 function boostOpus(sdp) {
   return sdp.replace(
     /a=fmtp:(\d+) (.*useinbandfec=1.*)/g,
@@ -168,20 +200,23 @@ function boostOpus(sdp) {
   );
 }
 
+const transformSdp = (sdp) => boostOpus(preferCodec(sdp, "H264"));
+
 // ─── ХОСТ ────────────────────────────────────────────────────────────────
 let peer, currentCall, micGain, screenStream, micStream, audioCtx;
 
 $("btnHost").onclick = async () => {
   const token = $("tokenInput").value.trim();
   if (token.length < 16) return setStatus("токен слишком короткий (мин. 16)");
+  const q = PRESETS[$("preset").value];
 
   // 1. Экран + звук системы
   try {
     screenStream = await navigator.mediaDevices.getDisplayMedia({
       video: {
-        frameRate: { ideal: 60, max: 60 },
-        width: { ideal: 3840 },
-        height: { ideal: 2160 },
+        frameRate: { ideal: q.fps, max: q.fps },
+        width: { max: q.w },
+        height: { max: q.h },
       },
       audio: {
         echoCancellation: false,
@@ -201,7 +236,7 @@ $("btnHost").onclick = async () => {
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: true,   // чтобы звук игры из колонок не летел обратно
+          echoCancellation: true,   // звук игры из колонок не летит обратно
           noiseSuppression: true,
           autoGainControl: true,
           channelCount: 1,
@@ -268,17 +303,15 @@ $("btnHost").onclick = async () => {
       if (currentCall) currentCall.close(); // новый зритель вытесняет старого
 
       currentCall = peer.call(conn.peer, outStream, {
-        sdpTransform: boostOpus,
+        sdpTransform: transformSdp,
       });
 
-      // Максимальный битрейт видео
-      currentCall.on("stream", () => {});
       setTimeout(async () => {
         const pc = currentCall.peerConnection;
         for (const sender of pc.getSenders()) {
           if (sender.track?.kind !== "video") continue;
           const p = sender.getParameters();
-          p.encodings = [{ maxBitrate: 50_000_000, maxFramerate: 60 }];
+          p.encodings = [{ maxBitrate: q.bitrate, maxFramerate: q.fps }];
           p.degradationPreference = "maintain-framerate";
           await sender.setParameters(p).catch(() => {});
         }
@@ -341,7 +374,7 @@ $("btnView").onclick = async () => {
   });
 
   peer.on("call", (call) => {
-    call.answer(); // зритель ничего не отправляет
+    call.answer(undefined, { sdpTransform: transformSdp });
     call.on("stream", (stream) => {
       video.srcObject = stream;
       video.play().catch(() => setStatus("нажмите на видео для запуска"));
@@ -355,11 +388,16 @@ $("btnView").onclick = async () => {
   });
 };
 
-// Статистика в углу: разрешение, fps, битрейт
+// Статистика в углу: разрешение, fps, битрейт, кодек
 function startStats(pc) {
   let lastBytes = 0, lastTime = 0;
   setInterval(async () => {
     const stats = await pc.getStats();
+    let codec = "";
+    stats.forEach((r) => {
+      if (r.type === "codec" && r.mimeType?.startsWith("video/"))
+        codec = r.mimeType.slice(6);
+    });
     stats.forEach((r) => {
       if (r.type === "inbound-rtp" && r.kind === "video") {
         const mbps = lastTime
@@ -369,7 +407,7 @@ function startStats(pc) {
         lastBytes = r.bytesReceived;
         lastTime = r.timestamp;
         $("stats").textContent =
-          `${r.frameWidth || "?"}×${r.frameHeight || "?"} @ ${r.framesPerSecond || "?"} fps · ${mbps} Мбит/с`;
+          `${codec} · ${r.frameWidth || "?"}×${r.frameHeight || "?"} @ ${r.framesPerSecond || "?"} fps · ${mbps} Мбит/с`;
       }
     });
   }, 2000);
